@@ -329,6 +329,11 @@ where
         self.add_op(Operation::Empty(k));
     }
 
+    /// Clear the contents of some key, chosen psuedorandomly based on `index`.
+    pub fn clear_index(&mut self, index: usize) {
+        self.add_op(Operation::ClearIndex(index));
+    }
+
     fn apply_first(inner: &mut Inner<K, V, M, S>, op: &mut Operation<K, V>) {
         use std::mem;
         match *op {
@@ -376,6 +381,16 @@ where
                     }
                 }
             }
+            Operation::ClearIndex(index) => {
+                if let Some((k, vs)) = inner.data.remove_at_index(index) {
+                    // don't run destructor yet -- still in use by other map
+                    mem::forget(vs);
+                    *op = Operation::Clear(k);
+                } else {
+                    *op = Operation::None;
+                }
+            }
+            Operation::None => unreachable!(),
         }
     }
 
@@ -404,6 +419,8 @@ where
                     }
                 }
             }
+            Operation::ClearIndex(_) => unreachable!(),
+            Operation::None => {}
         }
     }
 }

@@ -196,6 +196,8 @@ enum Operation<K, V> {
     Remove(K, V),
     Empty(K),
     Clear(K),
+    ClearIndex(usize),
+    None,
 }
 
 mod write;
