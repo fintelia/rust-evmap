@@ -183,6 +183,7 @@
 
 extern crate rahashmap;
 
+use rahashmap::SafeHash;
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hash};
 
@@ -191,11 +192,11 @@ use inner::Inner;
 
 #[derive(Clone)]
 enum Operation<K, V> {
-    Replace(K, V),
-    Add(K, V),
-    Remove(K, V),
-    Empty(K),
-    Clear(K),
+    Replace(SafeHash, K, V),
+    Add(SafeHash, K, V),
+    Remove(SafeHash, K, V),
+    Empty(SafeHash, K),
+    Clear(SafeHash, K),
 }
 
 mod write;
@@ -274,15 +275,15 @@ where
         M: 'static + Clone,
     {
         let inner = if let Some(cap) = self.capacity {
-            Inner::with_capacity_and_hasher(self.meta, cap, self.hasher)
+            Inner::with_capacity_and_hasher(self.meta, cap, self.hasher.clone())
         } else {
-            Inner::with_hasher(self.meta, self.hasher)
+            Inner::with_hasher(self.meta, self.hasher.clone())
         };
 
         let mut w_handle = inner.clone();
         w_handle.mark_ready();
         let r = read::new(inner);
-        let w = write::new(w_handle, r.clone());
+        let w = write::new(w_handle, r.clone(), self.hasher);
         (r, w)
     }
 }

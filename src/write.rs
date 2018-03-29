@@ -2,6 +2,7 @@ use super::{Operation, ShallowCopy};
 use inner::Inner;
 use read::ReadHandle;
 
+use rahashmap::{self, Entry};
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hash};
 use std::sync::Arc;
@@ -52,11 +53,13 @@ where
     meta: M,
     first: bool,
     second: bool,
+    hash_state: S,
 }
 
 pub(crate) fn new<K, V, M, S>(
     w_handle: Inner<K, V, M, S>,
     r_handle: ReadHandle<K, V, M, S>,
+    hash_state: S,
 ) -> WriteHandle<K, V, M, S>
 where
     K: Eq + Hash + Clone,
@@ -74,6 +77,7 @@ where
         meta: m,
         first: true,
         second: false,
+        hash_state,
     }
 }
 
@@ -295,14 +299,16 @@ where
     ///
     /// The updated value-set will only be visible to readers after the next call to `refresh()`.
     pub fn insert(&mut self, k: K, v: V) {
-        self.add_op(Operation::Add(k, v));
+        let hash = rahashmap::make_hash(&self.hash_state, &k);
+        self.add_op(Operation::Add(hash, k, v));
     }
 
     /// Replace the value-set of the given key with the given value.
     ///
     /// The new value will only be visible to readers after the next call to `refresh()`.
     pub fn update(&mut self, k: K, v: V) {
-        self.add_op(Operation::Replace(k, v));
+        let hash = rahashmap::make_hash(&self.hash_state, &k);
+        self.add_op(Operation::Replace(hash, k, v));
     }
 
     /// Clear the value-set of the given key, without removing it.
@@ -310,97 +316,103 @@ where
     /// This will allocate an empty value-set for the key if it does not already exist.
     /// The new value will only be visible to readers after the next call to `refresh()`.
     pub fn clear(&mut self, k: K) {
-        self.add_op(Operation::Clear(k));
+        let hash = rahashmap::make_hash(&self.hash_state, &k);
+        self.add_op(Operation::Clear(hash, k));
     }
 
     /// Remove the given value from the value-set of the given key.
     ///
     /// The updated value-set will only be visible to readers after the next call to `refresh()`.
     pub fn remove(&mut self, k: K, v: V) {
-        self.add_op(Operation::Remove(k, v));
+        let hash = rahashmap::make_hash(&self.hash_state, &k);
+        self.add_op(Operation::Remove(hash, k, v));
     }
 
     /// Remove the value-set for the given key.
     ///
     /// The value-set will only disappear from readers after the next call to `refresh()`.
     pub fn empty(&mut self, k: K) {
-        self.add_op(Operation::Empty(k));
+        let hash = rahashmap::make_hash(&self.hash_state, &k);
+        self.add_op(Operation::Empty(hash, k));
     }
 
     fn apply_first(inner: &mut Inner<K, V, M, S>, op: &mut Operation<K, V>) {
         use std::mem;
         match *op {
-            Operation::Replace(ref key, ref mut value) => {
-                let vs = inner.data.entry(key.clone()).or_insert_with(Vec::new);
+            Operation::Replace(ref hash, ref key, ref mut value) => {
+                let vs = inner.data.entry_hashed_nocheck(*hash, key.clone()).or_insert_with(Vec::new);
                 // don't run destructors yet -- still in use by other map
                 for v in vs.drain(..) {
                     mem::forget(v);
                 }
                 vs.push(unsafe { value.shallow_copy() });
             }
-            Operation::Clear(ref key) => {
+            Operation::Clear(ref hash, ref key) => {
                 // don't run destructors yet -- still in use by other map
                 for v in inner
                     .data
-                    .entry(key.clone())
+                    .entry_hashed_nocheck(*hash, key.clone())
                     .or_insert_with(Vec::new)
                     .drain(..)
                 {
                     mem::forget(v);
                 }
             }
-            Operation::Add(ref key, ref mut value) => {
+            Operation::Add(ref hash, ref key, ref mut value) => {
                 inner
                     .data
-                    .entry(key.clone())
+                    .entry_hashed_nocheck(*hash, key.clone())
                     .or_insert_with(Vec::new)
                     .push(unsafe { value.shallow_copy() });
             }
-            Operation::Empty(ref key) => {
-                if let Some(mut vs) = inner.data.remove(key) {
+            Operation::Empty(ref hash, ref key) => {
+                if let Entry::Occupied(e) = inner.data.entry_hashed_nocheck(*hash, key.clone()) {
                     // don't run destructors yet -- still in use by other map
+                    let (_k, mut vs) = e.remove_entry();
                     for v in vs.drain(..) {
                         mem::forget(v);
                     }
                 }
             }
-            Operation::Remove(ref key, ref value) => {
-                if let Some(e) = inner.data.get_mut(key) {
+            Operation::Remove(ref hash, ref key, ref value) => {
+                inner.data.entry_hashed_nocheck(*hash, key.clone()).and_modify(|e| {
                     // find the first entry that matches all fields
                     if let Some(i) = e.iter().position(|v| v == value) {
                         let v = e.swap_remove(i);
                         // don't run destructor yet -- still in use by other map
                         mem::forget(v);
                     }
-                }
+                });
             }
         }
     }
 
     fn apply_second(inner: &mut Inner<K, V, M, S>, op: Operation<K, V>) {
         match op {
-            Operation::Replace(key, value) => {
-                let v = inner.data.entry(key).or_insert_with(Vec::new);
+            Operation::Replace(hash, key, value) => {
+                let v = inner.data.entry_hashed_nocheck(hash, key).or_insert_with(Vec::new);
                 v.clear();
                 v.push(value);
             }
-            Operation::Clear(key) => {
-                let v = inner.data.entry(key).or_insert_with(Vec::new);
+            Operation::Clear(hash, key) => {
+                let v = inner.data.entry_hashed_nocheck(hash, key).or_insert_with(Vec::new);
                 v.clear();
             }
-            Operation::Add(key, value) => {
-                inner.data.entry(key).or_insert_with(Vec::new).push(value);
+            Operation::Add(hash, key, value) => {
+                inner.data.entry_hashed_nocheck(hash, key).or_insert_with(Vec::new).push(value);
             }
-            Operation::Empty(key) => {
-                inner.data.remove(&key);
+            Operation::Empty(hash, key) => {
+                if let Entry::Occupied(e) = inner.data.entry_hashed_nocheck(hash, key) {
+                    e.remove_entry();
+                }
             }
-            Operation::Remove(key, value) => {
-                if let Some(e) = inner.data.get_mut(&key) {
+            Operation::Remove(hash, key, value) => {
+                inner.data.entry_hashed_nocheck(hash, key).and_modify(|e| {
                     // find the first entry that matches all fields
                     if let Some(i) = e.iter().position(|v| v == &value) {
                         e.swap_remove(i);
                     }
-                }
+                });
             }
         }
     }
