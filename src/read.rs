@@ -1,5 +1,6 @@
 use inner::Inner;
 
+use rahashmap;
 use std::borrow::Borrow;
 use std::cell;
 use std::collections::hash_map::RandomState;
@@ -24,6 +25,7 @@ where
     pub(crate) inner: sync::Arc<AtomicPtr<Inner<K, V, M, S>>>,
     epoch: sync::Arc<sync::atomic::AtomicUsize>,
     my_epoch: sync::atomic::AtomicUsize,
+    hash_state: S,
 
     // Since a `ReadHandle` keeps track of its own epoch, it is not safe for multiple threads to
     // call `with_handle` at the same time. We *could* keep it `Sync` and make `with_handle`
@@ -37,7 +39,7 @@ where
 impl<K, V, M, S> Clone for ReadHandle<K, V, M, S>
 where
     K: Eq + Hash,
-    S: BuildHasher,
+    S: BuildHasher + Clone,
     M: Clone,
 {
     fn clone(&self) -> Self {
@@ -47,6 +49,7 @@ where
             epoch: epoch,
             my_epoch: atomic::AtomicUsize::new(0),
             inner: sync::Arc::clone(&self.inner),
+            hash_state: self.hash_state.clone(),
             _not_sync_no_feature: PhantomData,
         }
     }
@@ -55,17 +58,19 @@ where
 pub(crate) fn new<K, V, M, S>(inner: Inner<K, V, M, S>) -> ReadHandle<K, V, M, S>
 where
     K: Eq + Hash,
-    S: BuildHasher,
+    S: BuildHasher + Clone,
 {
     // tell writer about our epoch tracker
     let epoch = sync::Arc::new(atomic::AtomicUsize::new(0));
     inner.epochs.lock().unwrap().push(Arc::clone(&epoch));
 
+    let hash_state = inner.data.hasher().clone();
     let store = Box::into_raw(Box::new(inner));
     ReadHandle {
         epoch: epoch,
         my_epoch: atomic::AtomicUsize::new(0),
         inner: sync::Arc::new(AtomicPtr::new(store)),
+        hash_state,
         _not_sync_no_feature: PhantomData,
     }
 }
@@ -165,11 +170,15 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq,
     {
+        let hash = rahashmap::make_hash(&self.hash_state, key);
         self.with_handle(move |inner| {
             if !inner.is_ready() {
                 None
             } else {
-                inner.data.get(key).map(move |v| then(&**v))
+                inner
+                    .data
+                    .get_hashed_nocheck(hash, key)
+                    .map(move |v| then(&**v))
             }
         })
     }
@@ -191,11 +200,15 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq,
     {
+        let hash = rahashmap::make_hash(&self.hash_state, key);
         self.with_handle(move |inner| {
             if !inner.is_ready() {
                 None
             } else {
-                let res = inner.data.get(key).map(move |v| then(&**v));
+                let res = inner
+                    .data
+                    .get_hashed_nocheck(hash, key)
+                    .map(move |v| then(&**v));
                 let res = (res, inner.meta.clone());
                 Some(res)
             }
@@ -211,7 +224,8 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq,
     {
-        self.with_handle(move |inner| inner.data.contains_key(key))
+        let hash = rahashmap::make_hash(&self.hash_state, key);
+        self.with_handle(move |inner| inner.data.contains_key_hashed_nocheck(hash, key))
     }
 
     /// Read all values in the map, and transform them into a new collection.
